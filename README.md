@@ -1,8 +1,5 @@
 # Sklearn MLOps: Airflow + MLflow + FastAPI + MinIO + PostgreSQL
 
-Project hoàn chỉnh kế thừa luồng từ các tutorial trong thư mục LAB. Build trực tiếp từ public images; không cần chạy hay build các tutorial cũ.
-
-Kết quả kiểm chứng thực tế: xem [docs/verification.md](docs/verification.md).
 
 ## Chạy nhanh
 
