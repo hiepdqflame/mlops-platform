@@ -55,16 +55,20 @@ def training_pipeline():
     def verify_serving(result):
         import time
         import requests
-        from mlops.pipeline import client, get_alias
+        from mlops.pipeline import client, finalize_run, get_alias
         champion = get_alias(client(), result['model_name'], 'champion')
         if champion is None:
+            finalize_run(result['run_id'])
             return {'status': 'no_champion', 'candidate_rejected': True}
-        for _ in range(30):
+        timeout = float(os.getenv('VERIFY_SERVING_TIMEOUT_SECONDS', '180'))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             response = requests.get(os.environ['API_URL'] + '/health/ready', timeout=5)
             if response.ok and response.json()['model_version'] == str(champion.version):
+                finalize_run(result['run_id'])
                 return response.json()
-            time.sleep(2)
-        raise RuntimeError('FastAPI did not load the champion within 60 seconds')
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+        raise RuntimeError(f'FastAPI did not load the champion within {timeout:g} seconds')
 
     verify_serving(register_promote(evaluate_model(train_model(validate_split(extract_dataset())))))
 

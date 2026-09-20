@@ -15,7 +15,10 @@ from sklearn.datasets import load_breast_cancer
 def wait_for(description, check, seconds=600):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        value = check()
+        try:
+            value = check()
+        except (requests.Timeout, requests.ConnectionError):
+            value = None
         if value:
             return value
         time.sleep(3)

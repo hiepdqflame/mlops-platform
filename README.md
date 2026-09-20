@@ -6,13 +6,21 @@ Kết quả kiểm chứng thực tế: xem [docs/verification.md](docs/verifica
 
 ## Chạy nhanh
 
-Cần Docker Engine/Desktop và Docker Compose v2 trở lên. Nên cấp Docker khoảng 6 GB RAM và 4 CPU. Chạy trong thư mục `mlops-platform`:
+Cần Docker Engine 24+ hoặc Docker Desktop, Docker Compose 2.20+ và Linux containers. Cấp Docker ít nhất 6 GB RAM (khuyến nghị 8 GB), 4 CPU và khoảng 15 GB đĩa trống cho images/build cache. Không cần cài Python, PostgreSQL hay Airflow trên host. Chạy trong thư mục `mlops-platform`:
 
 ```bash
 cp .env.example .env
 docker compose up -d --build --wait --wait-timeout 300
 docker compose ps -a
 ```
+
+Trên Windows PowerShell dùng `Copy-Item .env.example .env` thay cho `cp`; các lệnh `docker compose` giữ nguyên. Bật WSL2 backend/Linux containers trong Docker Desktop. Makefile là tiện ích tùy chọn, không cần cài `make` trên Windows.
+
+Phạm vi nền tảng: Linux x86-64/ARM64, macOS Intel/Apple Silicon qua Docker Desktop, Windows x86-64 qua Docker Desktop + WSL2. Không hỗ trợ Windows containers, CPU 32-bit hoặc máy không chạy được Docker Linux. Host vẫn cần internet/proxy hợp lệ khi build lần đầu và các cổng cấu hình phải chưa bị chiếm. Không đồng nghĩa đã chạy trực tiếp trên mọi phiên bản Windows/macOS/Linux; bằng chứng kiểm thử từng kiến trúc được ghi trong `docs/verification.md`.
+
+Image nền được pin bằng digest multi-platform; Python dependencies được cố định bằng `requirements-runtime.lock` và `requirements-airflow.lock` dùng làm pip constraints. `.gitattributes` và bước normalize init script xử lý CRLF khi copy/checkout trên Windows. Toàn bộ source được COPY vào image; storage dùng named volumes, không có host path/UID cố định hay phụ thuộc repo cha.
+
+Nếu cổng bị chiếm, đổi `MLFLOW_PORT`, `AIRFLOW_PORT`, `API_PORT`, `MINIO_API_PORT`, `MINIO_CONSOLE_PORT` trong `.env`. Nếu chạy nhiều bản project cùng máy, đặt `COMPOSE_PROJECT_NAME` khác nhau và chọn các cổng khác nhau; image, network và volumes sẽ được tách theo project name. Password chứa ký tự đặc biệt có thể đặt trong dấu nháy đơn trong `.env`, ví dụ `AIRFLOW_DB_PASSWORD='abc@:/?#%xyz'`.
 
 Lần đầu cần internet để tải images và Python packages. Dữ liệu sklearn đã đi kèm package, không cần tải dataset riêng. Các giá trị mặc định trong Compose cho phép chạy cả khi chưa có `.env`.
 
@@ -63,9 +71,9 @@ Dữ liệu có 569 dòng và 30 features; `0=malignant`, `1=benign`. Đây là 
 
 Model mặc định: `breast-cancer-classifier`; experiment: `sklearn-breast-cancer`. Tên và ngưỡng có thể đổi trong `.env` rồi recreate các service bằng `docker compose up -d`.
 
-Mỗi DAG run mới tạo một MLflow run và một model version mới. Retry cùng DAG run tái sử dụng run; task registry tìm version theo run ID trước khi đăng ký. DAG giới hạn một writer để tránh hai lần promotion chạy đua. Không chạy thêm writer bên ngoài đồng thời; đây không phải giao dịch exactly-once xuyên nhiều hệ thống.
+Mỗi DAG run mới tạo một MLflow run và một model version mới. Retry cùng DAG run tái sử dụng run; task registry tìm version theo run ID trước khi đăng ký. Sau khi có version đăng ký, chạy lại các task extract/split/train/evaluate không ghi đè dữ liệu, model hoặc metrics. Muốn train lại phải trigger DAG run mới. Kết quả registration được lưu vào tag `pipeline.registration`; replay task cũ không chuyển alias ngược về model cũ. DAG giới hạn một writer để tránh hai lần promotion chạy đua. Không chạy thêm writer bên ngoài đồng thời; đây không phải giao dịch exactly-once xuyên nhiều hệ thống.
 
-Tags truy vết gồm dataset, dataset hash, algorithm, Airflow run ID, code version và phiên bản sklearn; version có thêm `quality_gate`, `gate.min_auc`, `gate.min_accuracy`. Run có `pipeline.status`, `model.version`, `promotion`. Trạng thái MLflow run có thể FINISHED sau task training; dùng `pipeline.status` và trạng thái Airflow DAG để xem toàn bộ workflow.
+Tags truy vết gồm dataset, dataset hash, algorithm, Airflow run ID, code version và phiên bản sklearn; version có thêm `quality_gate`, `gate.min_auc`, `gate.min_accuracy`. Run có `pipeline.status`, `model.version`, `promotion`. MLflow run giữ trạng thái RUNNING trong lượt chạy đầu đến khi task xác nhận serving thành công. Registration đặt `pipeline.status=awaiting_serving`; task cuối mới đặt `completed` và FINISHED. Nếu task cuối từng fail, clear/retry thành công sẽ phục hồi metadata từ FAILED sang FINISHED.
 
 - `challenger`: ứng viên đăng ký gần nhất, kể cả bị từ chối.
 - `champion`: version đang được phép phục vụ.
@@ -85,6 +93,8 @@ XCom chỉ chứa run ID/kết quả đăng ký nhỏ. Snapshot và model đư�
 ## FastAPI và cập nhật model
 
 API định kỳ tra alias `champion` (10 giây mặc định), resolve ra version cố định rồi mới tải model. Tải và kiểm tra schema thành công mới thay snapshot trong RAM. Request luôn trả đúng version/run ID đã dùng, kể cả alias thay đổi trong lúc dự đoán.
+
+`VERIFY_SERVING_TIMEOUT_SECONDS` mặc định 180 giây; nếu tăng `MODEL_REFRESH_SECONDS`, đặt timeout lớn hơn chu kỳ refresh cộng thời gian tải model. Task vẫn chịu execution timeout 10 phút của Airflow.
 
 - `GET /health/live`: tiến trình còn sống.
 - `GET /health/ready`: `200` nếu có model, `503` nếu chưa có; hiển thị version và lỗi refresh gần nhất.
@@ -139,7 +149,7 @@ docker compose exec postgres psql -U postgres -d airflow -c \
 
 Lỗi tạm thời được retry hai lần, cách nhau 20 giây. Validation hỏng dừng ngay, không retry vô ích. Callback đánh dấu MLflow run failed khi task hết retry; khi MLflow ngắt hoàn toàn, callback cũng có thể không cập nhật được và Airflow logs là nguồn điều tra.
 
-Rollback cần có ít nhất hai lần promotion. Tạm pause DAG để lịch tự động không lập tức thay đổi lại champion:
+Rollback cần có ít nhất hai lần promotion. Tạm pause DAG và chờ tất cả DAG runs đang chạy hoàn tất rồi mới rollback: thao tác pause không dừng một run đang hoạt động.
 
 ```bash
 docker compose exec airflow-scheduler airflow dags pause sklearn_training
