@@ -1,0 +1,203 @@
+name: sklearn-mlops
+
+x-runtime: &runtime
+  build: .
+  image: sklearn-mlops-runtime:1.0
+  networks: [mlops]
+
+x-client-env: &client-env
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  MLFLOW_HTTP_REQUEST_TIMEOUT: "30"
+  MODEL_NAME: ${MODEL_NAME:-breast-cancer-classifier}
+  MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-sklearn-breast-cancer}
+  MIN_VALIDATION_AUC: ${MIN_VALIDATION_AUC:-0.95}
+  MIN_VALIDATION_ACCURACY: ${MIN_VALIDATION_ACCURACY:-0.90}
+
+x-airflow-env: &airflow-env
+  <<: *client-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+  AIRFLOW__CORE__PARALLELISM: "4"
+  AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_CMD: python /opt/airflow/project/scripts/db_uri.py airflow
+  AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow_lab_password}
+  AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-local-lab-change-this-secret}
+  AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+  AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+  AIRFLOW_SCHEDULE: ${AIRFLOW_SCHEDULE:-@daily}
+  API_URL: http://api:8000
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
+
+x-airflow: &airflow
+  build:
+    context: .
+    dockerfile: docker/airflow.Dockerfile
+  image: sklearn-mlops-airflow:2.10.5
+  environment: *airflow-env
+  networks: [mlops]
+  volumes:
+    - airflow_logs:/opt/airflow/logs
+  restart: unless-stopped
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/postgres.Dockerfile
+    image: sklearn-mlops-postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_lab_password}
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow_lab_password}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow_lab_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [mlops]
+    restart: unless-stopped
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_lab_password}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-19030}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-19031}:9001"
+    healthcheck:
+      test: [CMD, curl, -f, http://localhost:9000/minio/health/live]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [mlops]
+    restart: unless-stopped
+
+  minio-init:
+    <<: *runtime
+    command: [python, scripts/init_bucket.py]
+    environment: &s3-env
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_lab_password}
+      AWS_DEFAULT_REGION: us-east-1
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+  mlflow:
+    <<: *runtime
+    command: [python, scripts/start_mlflow.py]
+    environment:
+      <<: *s3-env
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow_lab_password}
+    ports:
+      - "127.0.0.1:${MLFLOW_PORT:-15030}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+    restart: unless-stopped
+
+  api:
+    <<: *runtime
+    environment:
+      <<: *client-env
+      MODEL_REFRESH_SECONDS: ${MODEL_REFRESH_SECONDS:-10}
+    ports:
+      - "127.0.0.1:${API_PORT:-18031}:8000"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow
+    command: [bash, -ec, "airflow db migrate && python /opt/airflow/project/scripts/init_airflow.py"]
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin_lab_password}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow
+    command: webserver
+    ports:
+      - "127.0.0.1:${AIRFLOW_PORT:-18030}:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, curl, --fail, http://localhost:8080/health]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, curl, --fail, http://localhost:8974/health]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  tools:
+    <<: *runtime
+    profiles: [tools]
+    command: [python, scripts/smoke.py]
+    environment:
+      <<: [*client-env, *s3-env]
+      API_URL: http://api:8000
+      AIRFLOW_URL: http://airflow-webserver:8080
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin_lab_password}
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow_lab_password}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow_lab_password}
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+      airflow-scheduler:
+        condition: service_healthy
+
+networks:
+  mlops:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  airflow_logs:
